@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::message::Message;
+use rdkafka::message::{BorrowedMessage, Message};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -43,9 +43,7 @@ impl SettlementEngine {
     }
 
     pub async fn process_settlement(&self, event: SettlementEvent) -> Result<SettlementOutcome> {
-        let mut cache = self.processed_trades.lock().await;
-
-        if cache.contains(&event.trade_id) {
+        if !self.claim_trade(&event.trade_id).await {
             warn!(
                 trade_id = %event.trade_id,
                 "Duplicate trade event detected. Skipping re-settlement."
@@ -59,9 +57,12 @@ impl SettlementEngine {
             amount = event.amount_micros,
             "Executing settlement on ledger balance..."
         );
-
-        cache.insert(event.trade_id);
         Ok(SettlementOutcome::Applied)
+    }
+
+    async fn claim_trade(&self, trade_id: &str) -> bool {
+        let mut cache = self.processed_trades.lock().await;
+        cache.insert(trade_id.to_owned())
     }
 }
 
@@ -88,6 +89,18 @@ fn decode_event(payload: &[u8]) -> Result<SettlementEvent> {
     serde_json::from_slice(payload).context("Failed to decode settlement event payload")
 }
 
+fn extract_payload<'a>(
+    payload: Option<&'a [u8]>,
+) -> std::result::Result<&'a [u8], SettlementError> {
+    payload.ok_or(SettlementError::EmptyPayload)
+}
+
+fn commit_offset(consumer: &StreamConsumer, msg: &BorrowedMessage<'_>) {
+    if let Err(err) = consumer.commit_message(msg, CommitMode::Async) {
+        error!(error = ?err, "Failed to commit Kafka offset");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -103,12 +116,9 @@ async fn main() -> Result<()> {
     let engine = Arc::new(SettlementEngine::new());
     let consumer = build_consumer(&brokers, group_id)?;
 
-    if let Err(err) = consumer.subscribe(&[topic]) {
-        warn!(
-            error = %err,
-            "Kafka subscription failed; proceeding in simulation mode."
-        );
-    }
+    consumer
+        .subscribe(&[topic])
+        .context("Failed to subscribe settlement consumer to Kafka topic")?;
 
     info!(
         topic = topic,
@@ -126,10 +136,11 @@ async fn main() -> Result<()> {
             msg_result = consumer.recv() => {
                 match msg_result {
                     Ok(msg) => {
-                        let payload = match msg.payload() {
-                            Some(payload) => payload,
-                            None => {
-                                error!(error = %SettlementError::EmptyPayload, "Settlement message missing payload; dropping event.");
+                        let payload = match extract_payload(msg.payload()) {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                error!(error = %err, "Settlement message missing payload; skipping and committing offset.");
+                                commit_offset(&consumer, &msg);
                                 continue;
                             }
                         };
@@ -141,12 +152,11 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
 
-                                if let Err(err) = consumer.commit_message(&msg, CommitMode::Async) {
-                                    error!(error = ?err, "Failed to commit Kafka offset");
-                                }
+                                commit_offset(&consumer, &msg);
                             }
                             Err(err) => {
-                                error!(error = ?err, "Malformed payload received; dropping to DLQ.");
+                                error!(error = ?err, "Malformed payload received; skipping and committing offset.");
+                                commit_offset(&consumer, &msg);
                             }
                         }
                     }
@@ -200,5 +210,21 @@ mod tests {
         let event = decode_event(payload).unwrap();
 
         assert_eq!(event, fixture_event());
+    }
+
+    #[test]
+    fn rejects_invalid_settlement_payload() {
+        let err = decode_event(br#"{"trade_id":42}"#).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Failed to decode settlement event payload"));
+    }
+
+    #[test]
+    fn rejects_empty_payload() {
+        let err = extract_payload(None).unwrap_err();
+
+        assert_eq!(err.to_string(), "settlement message payload is empty");
     }
 }
