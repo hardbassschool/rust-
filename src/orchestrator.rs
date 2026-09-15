@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 
 use crate::engine::{
     BoxFuture, DeduplicationStore, LedgerSettlementTool, SettlementEngine, SettlementError,
+    TradeClaim,
 };
 use crate::planner::{
     ExecutionPlan, Planner, ProcessingGoal, ProcessingGraph, ProcessingStage, StageDecision,
@@ -29,6 +30,7 @@ pub enum ProcessingOutcome {
 pub struct ProcessingReport {
     pub metadata: MessageMetadata,
     pub outcome: ProcessingOutcome,
+    pub detail: String,
     pub committed: bool,
     pub executed_stages: Vec<ProcessingStage>,
     pub plan: ExecutionPlan,
@@ -105,6 +107,7 @@ where
         let payload = match envelope.payload.as_deref() {
             Some(payload) => payload,
             None => {
+                let detail = format!("{}", SettlementError::EmptyPayload);
                 return self
                     .commit_and_report(
                         envelope.metadata,
@@ -114,7 +117,7 @@ where
                         StageDecision::CommitAndReport,
                         "validate",
                         ProcessingOutcome::EmptyPayload,
-                        format!("{}", SettlementError::EmptyPayload),
+                        detail,
                     )
                     .await;
             }
@@ -124,6 +127,7 @@ where
             Ok(event) => event,
             Err(err) => {
                 error!(error = ?err, "Malformed payload received; skipping and committing offset.");
+                let detail = err.to_string();
                 return self
                     .commit_and_report(
                         envelope.metadata,
@@ -133,7 +137,7 @@ where
                         StageDecision::CommitAndReport,
                         "validate",
                         ProcessingOutcome::InvalidPayload,
-                        "Malformed payload".to_string(),
+                        detail,
                     )
                     .await;
             }
@@ -177,24 +181,54 @@ where
             "Checking idempotency boundary for trade",
         );
 
-        if !self.engine.claim_trade(&event.trade_id).await {
-            warn!(
-                trade_id = %event.trade_id,
-                account_id = %event.account_id,
-                "Duplicate trade event detected. Skipping re-settlement."
-            );
-            return self
-                .commit_and_report(
-                    envelope.metadata,
-                    plan,
-                    executed_stages,
+        match self.engine.begin_settlement(&event.trade_id).await {
+            TradeClaim::Duplicate => {
+                warn!(
+                    trade_id = %event.trade_id,
+                    account_id = %event.account_id,
+                    "Duplicate trade event detected. Skipping re-settlement."
+                );
+                return self
+                    .commit_and_report(
+                        envelope.metadata,
+                        plan,
+                        executed_stages,
+                        ProcessingStage::Deduplicate,
+                        StageDecision::CommitAndReport,
+                        "deduplicate",
+                        ProcessingOutcome::Duplicate,
+                        "Duplicate trade skipped".to_string(),
+                    )
+                    .await;
+            }
+            TradeClaim::InFlight => {
+                warn!(
+                    trade_id = %event.trade_id,
+                    account_id = %event.account_id,
+                    "Trade is already in flight; leaving offset uncommitted for retry."
+                );
+                let report_stage = Self::advance_stage(
                     ProcessingStage::Deduplicate,
-                    StageDecision::CommitAndReport,
-                    "deduplicate",
-                    ProcessingOutcome::Duplicate,
-                    "Duplicate trade skipped".to_string(),
-                )
-                .await;
+                    StageDecision::ReportOnly,
+                    &mut executed_stages,
+                );
+                debug_assert_eq!(report_stage, Some(ProcessingStage::Report));
+                let detail = "Trade is already in flight".to_string();
+                self.tools
+                    .observer
+                    .observe("report", &envelope.metadata, &detail);
+                return Ok(ProcessingReport {
+                    metadata: envelope.metadata,
+                    outcome: ProcessingOutcome::ProcessingFailed {
+                        reason: detail.clone(),
+                    },
+                    detail,
+                    committed: false,
+                    executed_stages,
+                    plan,
+                });
+            }
+            TradeClaim::Acquired => {}
         }
 
         let settle_stage = Self::advance_stage(
@@ -210,6 +244,7 @@ where
         );
 
         if let Err(err) = self.engine.apply_settlement(&event).await {
+            self.engine.release_settlement(&event.trade_id).await;
             error!(
                 error = ?err,
                 trade_id = %event.trade_id,
@@ -234,11 +269,14 @@ where
                 outcome: ProcessingOutcome::ProcessingFailed {
                     reason: err.to_string(),
                 },
+                detail: err.to_string(),
                 committed: false,
                 executed_stages,
                 plan,
             });
         }
+
+        self.engine.complete_settlement(&event.trade_id).await;
 
         self.commit_and_report(
             envelope.metadata,
@@ -308,6 +346,7 @@ where
         Ok(ProcessingReport {
             metadata,
             outcome,
+            detail,
             committed,
             executed_stages,
             plan,
@@ -390,6 +429,26 @@ mod tests {
         }
     }
 
+    struct FailOnceLedger {
+        fail_once: Mutex<bool>,
+    }
+
+    impl LedgerSettlementTool for FailOnceLedger {
+        fn apply<'a>(
+            &'a self,
+            _event: &'a crate::engine::SettlementEvent,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                let mut fail_once = self.fail_once.lock().await;
+                if *fail_once {
+                    *fail_once = false;
+                    anyhow::bail!("simulated ledger failure");
+                }
+                Ok(())
+            })
+        }
+    }
+
     fn orchestrator() -> SettlementOrchestrator<
         SettlementPlanner,
         InMemoryDeduplicationStore,
@@ -427,6 +486,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.outcome, ProcessingOutcome::Applied);
+        assert_eq!(report.detail, "Settlement applied");
         assert!(report.committed);
         assert_eq!(
             report.executed_stages,
@@ -453,6 +513,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.outcome, ProcessingOutcome::InvalidPayload);
+        assert!(report
+            .detail
+            .contains("Failed to decode settlement event payload"));
         assert!(report.committed);
         assert_eq!(
             report.executed_stages,
@@ -509,6 +572,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.outcome, ProcessingOutcome::EmptyPayload);
+        assert_eq!(report.detail, "settlement message payload is empty");
         assert!(report.committed);
+    }
+
+    #[tokio::test]
+    async fn failed_settlement_is_retryable_after_claim_release() {
+        let orchestrator = SettlementOrchestrator::new(
+            SettlementPlanner,
+            SettlementEngine::with_components(
+                InMemoryDeduplicationStore::default(),
+                FailOnceLedger {
+                    fail_once: Mutex::new(true),
+                },
+            ),
+            ToolRegistry::new(
+                JsonPayloadDecoder,
+                RecordingCommitter::default(),
+                NoopObserver,
+            ),
+            SettlementPolicy,
+            4,
+        );
+        let envelope = MessageEnvelope {
+            metadata: metadata(),
+            payload: Some(
+                br#"{"trade_id":"trade-123","account_id":"acct-42","asset_pair":"BTC/USD","amount_micros":150000,"execution_timestamp":1726437600}"#
+                    .to_vec(),
+            ),
+        };
+
+        let first = orchestrator
+            .process_message(envelope.clone())
+            .await
+            .unwrap();
+        let second = orchestrator.process_message(envelope).await.unwrap();
+
+        assert_eq!(
+            first.outcome,
+            ProcessingOutcome::ProcessingFailed {
+                reason: "simulated ledger failure".to_string(),
+            }
+        );
+        assert!(!first.committed);
+        assert_eq!(second.outcome, ProcessingOutcome::Applied);
+        assert!(second.committed);
     }
 }
